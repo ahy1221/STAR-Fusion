@@ -27,6 +27,7 @@ my $out_prefix = "star-fusion";
 my $chimeric_junction_file;
 my $chimeric_out_sam;
 my $help_flag;
+my $virus_integration_flag;
 my $MIN_NOVEL_JUNCTION_SUPPORT = 3;
 my $MIN_JUNCTION_READS = 1;
 my $MIN_SUM_FRAGS = 2;
@@ -70,6 +71,7 @@ __EOUSAGE__
 
 
 &GetOptions ( 'h' => \$help_flag,
+              'virus' => \$virus_integration_flag,
               
               'chimeric_junction|J=s' => \$chimeric_junction_file,
               'genome_lib_dir=s' => \$genome_lib_dir,
@@ -124,31 +126,223 @@ main: {
     
     print STDERR "-parsing fusion evidence: $chimeric_junction_file\n";
 
-    my %all_virus_genes_candidate_complex_names;
-    my %integration_breakpoint_to_read_names;
-    my %integration_spans_to_read_names;
-    my %integration_breakpoint_to_long_anchors;
+    my %all_virus_genes_candidate_complex_names; # {vts_complex_name} = info struct. complex_name = gene_symbolA^gene_idA--virus_id:coord:strand
+    my %integration_breakpoint_to_read_names; # {vts_complex_name} -> {breakpoint} -> {read_name} = 1
+    my %integration_spans_to_read_names; # {vts_complex_name} -> {breakpoint} = 1
+    my %integration_breakpoint_to_long_anchors; #　{vts_complex_name} -> {breakpoint} -> {virus} = 1
     
-    &map_chimeric_reads_to_genes_and_virus($chimeric_junction_file,
-                                           \%chr_to_interval_tree,
-                                           \%chr_gene_trans_to_exons,
+    if ($virus_integration_flag) {
+        
+        &map_chimeric_reads_to_genes_and_virus($chimeric_junction_file,
+                                               \%chr_to_interval_tree,
+                                               \%chr_gene_trans_to_exons,
                                            
-                                           \%all_virus_genes_candidate_complex_names,
-                                           \%integration_breakpoint_to_read_names,
-                                           \%integration_spans_to_read_names,
+                                               \%all_virus_genes_candidate_complex_names,
+                                               \%integration_breakpoint_to_read_names,
+                                               \%integration_spans_to_read_names,
                                            
-                                           $intermediates_out_prefix,
+                                               $intermediates_out_prefix,
                                            
-                                           \%integration_breakpoint_to_long_anchors,
-        );
-    print "[INFO]: print all VTS\n";
-    print Dumper \%all_virus_genes_candidate_complex_names;
-    print "[INFO]: print all VTS spans\n";
-    print Dumper \%integration_spans_to_read_names;
-    print "[INFO]: print all junction reads \n";
-    print Dumper \%integration_breakpoint_to_read_names;
-    print "[INFO]: print anchor\n";
-    print Dumper \%integration_breakpoint_to_long_anchors;
+                                               \%integration_breakpoint_to_long_anchors,
+            );
+
+        my @vts_candidates;
+        
+        my $junction_read_outfile = "$intermediates_out_prefix.virus.junction_read_names";
+        open (my $ofh_junc, ">$junction_read_outfile") or die "Error, cannot write to $junction_read_outfile";
+        my $spanning_read_outfile = "$intermediates_out_prefix.virus.spanning_frag_names";
+        open( my $ofh_span , ">$spanning_read_outfile" ) or die "Error, cannot write to $spanning_read_outfile";
+        foreach my $vts_complex_name (keys %all_virus_genes_candidate_complex_names) {
+            ## get the span support
+            my $spanning_reads_href = $integration_spans_to_read_names{$vts_complex_name};
+            my @spanning_reads;
+
+            if (ref $spanning_reads_href) {
+                @spanning_reads = keys %$spanning_reads_href;
+                foreach my $span_read (@spanning_reads) {
+                    print $ofh_span "$vts_complex_name\t$span_read\n";
+                }
+            }
+
+            my $vts_info_struct = $all_virus_genes_candidate_complex_names{$vts_complex_name};
+            # Here I make vts_simple_name as the same as vts_complex_name because of the lacking of virus gene annotation
+            my ($left_gene_id, $right_gene_id, $vts_simple_name) = ($vts_info_struct->{left_gene_id},
+                                                                    $vts_info_struct->{right_gene_id},
+                                                                    $vts_info_struct->{vts_complex_name});
+
+            my $vts_info_href = $integration_breakpoint_to_read_names{$vts_complex_name};
+            #print Dumper \%integration_breakpoint_to_read_names;
+            if ($vts_info_href) {
+                # sort by number of reads supporting the breakpoints
+                my @vts_breakpoints = reverse sort { scalar(keys %{$vts_info_href->{$a}}) <=> scalar(keys %{$vts_info_href->{$b}}) } keys %$vts_info_href;
+
+                # Select the best breakpoints
+                while (@vts_breakpoints) {
+                    my $best_breakpoint = shift @vts_breakpoints;
+                    #print $best_breakpoint, "\n";
+                    my ($left_coords, $left_delta, $right_coords, $right_delta) = split(/;/, $best_breakpoint);
+                    
+                    # identifying gene splice site 
+                    my $splice_type;
+                    if ($left_coords =~ /$virus_genome_pattern/) {
+                        $splice_type = ($right_delta == 0) ? "GENE_REF_SPLICE" : "GENE_NON_REF_SPLICE";
+                    } else {
+                        $splice_type = ($left_delta == 0) ? "GENE_REF_SPLICE" : "GENE_NON_REF_SPLICE";
+                    }
+
+                    my $junction_reads_href = $vts_info_href->{$best_breakpoint};
+                    my @junc_reads = keys %$junction_reads_href;
+
+                    my $breakpoints_count = scalar(@junc_reads);
+
+
+
+                    my %local_spanning_reads = map { + $_ => 1 } @spanning_reads;                
+                    
+                    foreach my $junction_read (@junc_reads) {
+                        print $ofh_junc "$vts_complex_name\t$best_breakpoint\t$junction_read\n";
+                        if (exists $local_spanning_reads{$junction_read}) {
+                            delete $local_spanning_reads{$junction_read};
+                        }
+                    }
+
+                    my @span_reads = keys %local_spanning_reads;
+                    my $span_count = scalar(@span_reads);
+
+                    my $score = 4 * $breakpoints_count + $span_count;
+
+                    my $virus_anchor_support = "NO_LVAS"; # Long Virus Anchor Support
+                    if ($integration_breakpoint_to_long_anchors{$vts_complex_name}->{$best_breakpoint}->{'virus'}) {
+                        $virus_anchor_support = "YES_LVAS";
+                    }
+
+
+                    my $vts_candidate = { vts_simple_name => $vts_simple_name,
+                                          vts_complex_name => $vts_complex_name,
+
+                                          junction_count => $breakpoints_count,
+                                          spanning_count => $span_count,
+
+                                          left_gene => $left_gene_id,
+                                          left_coords => $left_coords,
+                                          left_delta => $left_delta, # dist to ref splice junction if it is virus, always 0
+
+                                          right_gene => $right_gene_id,
+                                          right_coords => $right_coords,
+                                          right_delta => $right_delta, # Same as previous description
+
+                                          splice_type => $splice_type,
+
+                                          spanning_frag_names => \@span_reads,
+                                          junction_read_names => \@junc_reads,
+
+                                          score => $score,
+
+                                          long_double_anchor_support => $virus_anchor_support,
+                    };
+
+                    push (@vts_candidates, $vts_candidate);
+
+                } # end for each breakpoint
+                
+            } # end if breakpoint
+            # TODO Do not care pair support so far
+            
+        }
+        close $ofh_junc;
+        close $ofh_span;
+
+        my $vts_predictions_outfile = "$out_prefix.vts_candidates.preliminary";
+        open (my $ofh , ">$vts_predictions_outfile") or die "Error, cannot write to file: $vts_predictions_outfile";
+
+        print STDERR "-outputting virus integration candidates to file : $vts_predictions_outfile\n";
+
+        #print header
+        my @column_headers = ("#VirusIntegrationName",
+                              "JunctionReadCount",
+                              "SpanningFragCount",
+                              "SpliceType",
+                              "LeftGene",
+                              "LeftBreakpoint",
+                              "RightGene",
+                              "RightBreakpoint",
+                              "JunctionReads",
+                              "SpanningFrags",
+                              "LargeAnchorSupport");
+
+        my $tab_writer = new DelimParser::Writer($ofh, "\t", \@column_headers);
+        my $filt_file = "$intermediates_dir/vts_candidates.preliminary.filt_info";
+        open (my $ofh_filt, ">$filt_file") or die "Error, cannot write to $filt_file";
+
+        my $filt_tab_writer = new DelimParser::Writer($ofh_filt, "\t", [@column_headers, "FILTER_REASON"]);
+    
+    # examining fusions based on the specific junction breakpoint, regardless of genes assigned to.
+    
+        @vts_candidates = reverse sort {$a->{score}<=>$b->{score}} @vts_candidates;
+
+
+        foreach my $vts_candidate (@vts_candidates) {
+
+        
+            ## determine if we're filtering the fusion due to insufficient evidence.
+        
+            my $filt_reason = ".";
+        
+        
+            my $junction_count = $vts_candidate->{junction_count};
+            my $spanning_count = $vts_candidate->{spanning_count};
+            my $sum_frags = $junction_count + $spanning_count;
+            my $splice_type = $vts_candidate->{splice_type};
+        
+        
+            if ($sum_frags < $MIN_SUM_FRAGS) {
+                $filt_reason = "sum_frags:$sum_frags<min_sum_frags:$MIN_SUM_FRAGS";
+            }
+            elsif ($MIN_JUNCTION_READS > 0 && $junction_count < $MIN_JUNCTION_READS) {
+                $filt_reason = "J$junction_count<$MIN_JUNCTION_READS";
+            }
+        
+            
+        
+            my $junction_reads = join(",", @{$vts_candidate->{junction_read_names}}) || ".";
+            my $spanning_frags = join(",", @{$vts_candidate->{spanning_frag_names}}) || ".";
+        
+            my $row = { '#VirusIntegrationName' => $vts_candidate->{vts_simple_name}, 
+                    'JunctionReadCount' => $vts_candidate->{junction_count}, 
+                    'SpanningFragCount' => $vts_candidate->{spanning_count},
+                    'SpliceType' => $vts_candidate->{splice_type},
+                    'LeftGene' => $vts_candidate->{left_gene}, 
+                    'LeftBreakpoint' => $vts_candidate->{left_coords}, 
+                    'RightGene' => $vts_candidate->{right_gene}, 
+                    'RightBreakpoint' => $vts_candidate->{right_coords}, 
+                    'JunctionReads' => $junction_reads, 
+                    'SpanningFrags' => $spanning_frags,
+                    'LargeAnchorSupport' => $vts_candidate->{long_double_anchor_support},
+                    'FILTER_REASON' => $filt_reason,
+            };
+
+            $filt_tab_writer->write_row($row);
+        
+        
+            if ($filt_reason eq '.') {
+                $tab_writer->write_row($row);
+            }
+        }
+        close $ofh;
+        close $ofh_filt;
+        
+    }
+    
+    
+
+#    print "[INFO]: print all VTS\n";
+#    print Dumper \%all_virus_genes_candidate_complex_names;
+#    print "[INFO]: print all VTS spans\n";
+#    print Dumper \%integration_spans_to_read_names;
+#    print "[INFO]: print all junction reads \n";
+#    print Dumper \%integration_breakpoint_to_read_names;
+#    print "[INFO]: print anchor\n";
+#    print Dumper \%integration_breakpoint_to_long_anchors;
     
     &map_chimeric_reads_to_genes($chimeric_junction_file, 
                                  \%chr_to_interval_tree, 
@@ -790,7 +984,7 @@ sub map_chimeric_reads_to_genes_and_virus {
         }
 
        
-        print Dumper \@G_hits;
+        #print Dumper \@G_hits;
         # VTS as Virus inTegration Site
 
         foreach my $gene_possibility (@G_hits) {
@@ -798,11 +992,11 @@ sub map_chimeric_reads_to_genes_and_virus {
             my $right_entry;
             if ($VIRUS_POSITION_FLAG eq 'left' ) {
                 # TODO : Add annotation for virus
-                $left_entry = { "chr" => $chrA, "pt_align" => $coordA, "gene_id" => $chrA, "exon" => {"orient" => $chrA }, "delta" => 0 };
+                $left_entry = { "chr" => $chrA, "pt_align" => $coordA, "gene_id" => $chrA, "exon" => {"orient" => "*" }, "delta" => 0 };
                 $right_entry = $gene_possibility;
             } else {
                 $left_entry = $gene_possibility;
-                $right_entry = { "chr" => $chrB, "pt_align" => $coordB, "gene_id" => $chrB, "exon" => {"orient" => $chrB}, "delta" => 0 };
+                $right_entry = { "chr" => $chrB, "pt_align" => $coordB, "gene_id" => $chrB, "exon" => {"orient" => "*"}, "delta" => 0 };
             }
             
             if ($gene_possibility->{sense_or_antisense} eq 'antisense') {
@@ -810,11 +1004,12 @@ sub map_chimeric_reads_to_genes_and_virus {
             }
             
                 
-            my $left_gene_id = $left_entry->{gene_id};
             my $left_gene_name;
             my $left_id;
             my $right_gene_name;
             my $right_id;
+            
+            my $left_gene_id = $left_entry->{gene_id};
             if ($left_gene_id =~ /\^/) {
                ($left_gene_name, $left_id) = split(/\^/, $left_gene_id);
             }
