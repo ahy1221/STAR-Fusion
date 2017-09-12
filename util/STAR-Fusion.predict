@@ -33,7 +33,7 @@ my $MIN_SUM_FRAGS = 2;
 
 my $genome_lib_dir;
 
-my $REQUIRE_EXON_OVERLAP_FLAG = 1; # fixed for now, but may parameterize later on.
+my $REQUIRE_EXON_OVERLAP_FLAG = 0; # fixed for now, but may parameterize later on.
 
 my $LONG_ANCHOR_SIZE = 25;
 
@@ -94,7 +94,7 @@ my $ref_GTF = "$genome_lib_dir/ref_annot.gtf";
 unless (-s $ref_GTF) {
     die "Error, cannot locate reference annotation file: $ref_GTF";
 }
-
+my $virus_genome_pattern = "^NC_";
 
 main: {
     
@@ -123,6 +123,33 @@ main: {
     
     
     print STDERR "-parsing fusion evidence: $chimeric_junction_file\n";
+
+    my %all_virus_genes_candidate_complex_names;
+    my %integration_breakpoint_to_read_names;
+    my %integration_spans_to_read_names;
+    my %integration_breakpoint_to_long_anchors;
+    
+    &map_chimeric_reads_to_genes_and_virus($chimeric_junction_file,
+                                           \%chr_to_interval_tree,
+                                           \%chr_gene_trans_to_exons,
+                                           
+                                           \%all_virus_genes_candidate_complex_names,
+                                           \%integration_breakpoint_to_read_names,
+                                           \%integration_spans_to_read_names,
+                                           
+                                           $intermediates_out_prefix,
+                                           
+                                           \%integration_breakpoint_to_long_anchors,
+        );
+    print "[INFO]: print all VTS\n";
+    print Dumper \%all_virus_genes_candidate_complex_names;
+    print "[INFO]: print all VTS spans\n";
+    print Dumper \%integration_spans_to_read_names;
+    print "[INFO]: print all junction reads \n";
+    print Dumper \%integration_breakpoint_to_read_names;
+    print "[INFO]: print anchor\n";
+    print Dumper \%integration_breakpoint_to_long_anchors;
+    
     &map_chimeric_reads_to_genes($chimeric_junction_file, 
                                  \%chr_to_interval_tree, 
                                  \%chr_gene_trans_to_exons, 
@@ -684,6 +711,153 @@ sub get_overlapping_genes {
 
 
 ####
+sub map_chimeric_reads_to_genes_and_virus {
+    my ($junction_file, $chr_to_interval_tree_href, $chr_gene_trans_to_exons_href, 
+        $all_virus_genes_candidate_complex_names_href,  
+        $integration_breakpoint_to_read_names_href,
+        $integration_spans_to_read_names_href,
+        $intermediates_out_prefix,
+        $integration_breakpoint_to_long_anchor_href) = @_;
+
+    open (my $fh, $junction_file) or die "Error, cannot open file $junction_file";
+    while (<$fh>) {
+        chomp;
+        my $line = $_;
+        my @x = split(/\t/);
+         # from star doc:
+        #The rst 9 columns give information about the chimeric junction:
+
+        #The format of this le is as follows. Every line contains one chimerically aligned read, e.g.:
+        #chr22 23632601 + chr9 133729450 + 1 0 0 SINATRA-0006:3:3:6387:56650 23632554 47M29S 133729451 47S29M40p76M
+        #The first 9 columns give information about the chimeric junction:
+
+        #column 1: chromosome of the donor
+        #column 2: rst base of the intron of the donor (1-based)
+        #column 3: strand of the donor
+        #column 4: chromosome of the acceptor
+        #column 5: rst base of the intron of the acceptor (1-based)
+        #column 6: strand of the acceptor
+        #column 7: junction type: -1=encompassing junction (between the mates), 1=GT/AG, 2=CT/AC
+        #column 8: repeat length to the left of the junction
+        #column 9: repeat length to the right of the junction
+        #Columns 10-14 describe the alignments of the two chimeric segments, it is SAM like. Alignments are given with respect to the (+) strand
+        #column 10: read name
+        #column 11: rst base of the rst segment (on the + strand)
+        #column 12: CIGAR of the rst segment
+        #column 13: rst base of the second segment
+        #column 14: CIGAR of the second segment
+
+        # Skip not virus spans
+        next if ($x[0] !~ $virus_genome_pattern and $x[3] !~ $virus_genome_pattern);
+
+        my $junction_type = $x[6];
+        next if ($junction_type == -1 ) ; # But rather a split pair
+        my $read_name = $x[9];
+        my ($chrA, $coordA, $orientA) = ($x[0], $x[1], $x[2]);
+        $coordA = ($orientA eq '+') ? --$coordA : ++$coordA;
+        my ($rst_A, $cigar_A) = ($x[10], $x[11]);
+
+        my ($chrB, $coordB, $orientB) = ($x[3], $x[4], $x[5]);
+        $coordB = ($orientB eq '+') ? ++$coordB : --$coordB;
+        my ($rst_B, $cigar_B) = ($x[12], $x[13]);
+
+        my $PE_read_map_token = join("$;", $chrA, $rst_A, $cigar_A ,$chrB, $rst_B, $cigar_B);
+        my %seen;
+        if ($seen{$PE_read_map_token}) {
+            # rmdups
+            next;
+        } else {
+            $seen{$PE_read_map_token} = 1;
+        }
+
+        
+        my @G_hits; # Gene Hits
+
+        my $VIRUS_POSITION_FLAG;
+        my $virus_anchor_length;
+        if ($chrA !~ $virus_genome_pattern) {
+            @G_hits = &find_exon_junction_matches($chrA, $coordA, $orientA, 'left', $chr_to_interval_tree_href, $chr_gene_trans_to_exons_href, $rst_A, $cigar_A);
+            $VIRUS_POSITION_FLAG = "right";
+            my ($genome_coords_aref, $read_coords_aref) = &get_genome_coords_via_cigar($rst_B, $cigar_B, $orientB);
+            $virus_anchor_length = &compute_anchor_length($read_coords_aref, $VIRUS_POSITION_FLAG, $orientB);
+        }
+
+        if ($chrB !~ $virus_genome_pattern) {
+            @G_hits = &find_exon_junction_matches($chrB, $coordB, $orientB, 'right', $chr_to_interval_tree_href, $chr_gene_trans_to_exons_href, $rst_B, $cigar_B);
+            $VIRUS_POSITION_FLAG = "left";
+            my ($genome_coords_aref, $read_coords_aref) = &get_genome_coords_via_cigar($rst_A, $cigar_A, $orientA);
+            $virus_anchor_length = &compute_anchor_length($read_coords_aref, $VIRUS_POSITION_FLAG, $orientA);
+        }
+
+       
+        print Dumper \@G_hits;
+        # VTS as Virus inTegration Site
+
+        foreach my $gene_possibility (@G_hits) {
+            my $left_entry;
+            my $right_entry;
+            if ($VIRUS_POSITION_FLAG eq 'left' ) {
+                # TODO : Add annotation for virus
+                $left_entry = { "chr" => $chrA, "pt_align" => $coordA, "gene_id" => $chrA, "exon" => {"orient" => $chrA }, "delta" => 0 };
+                $right_entry = $gene_possibility;
+            } else {
+                $left_entry = $gene_possibility;
+                $right_entry = { "chr" => $chrB, "pt_align" => $coordB, "gene_id" => $chrB, "exon" => {"orient" => $chrB}, "delta" => 0 };
+            }
+            
+            if ($gene_possibility->{sense_or_antisense} eq 'antisense') {
+                    ($left_entry, $right_entry) = ($right_entry, $left_entry);
+            }
+            
+                
+            my $left_gene_id = $left_entry->{gene_id};
+            my $left_gene_name;
+            my $left_id;
+            my $right_gene_name;
+            my $right_id;
+            if ($left_gene_id =~ /\^/) {
+               ($left_gene_name, $left_id) = split(/\^/, $left_gene_id);
+            }
+            my $right_gene_id = $right_entry->{gene_id};
+            
+            if ($right_gene_id =~ /\^/) {
+               ($right_gene_name, $right_id) = split(/\^/, $right_gene_id);
+            }
+
+            #my $vts_simple_name = join("--", $left_gene_name, $right_gene_name);
+            my $vts_complex_name = join("--", $left_gene_id, $right_gene_id);
+            $all_virus_genes_candidate_complex_names_href->{$vts_complex_name} = {left_gene_id => $left_gene_id,
+                                                                                  right_gene_id => $right_gene_id,
+                                                                                  vts_complex_name => $vts_complex_name,
+                                                                                  #vts_simple_name => $vts_simple_name,
+                                                                                  left_coord => join(":", $left_entry->{chr}, $left_entry->{pt_align}),
+                                                                                  right_coord => join(":", $right_entry->{chr}, $right_entry->{pt_align})
+            };
+
+            if ($junction_type == -1) {
+                $integration_spans_to_read_names_href->{$vts_complex_name}->{$read_name} = 1;
+            } else {
+
+                my @at_exon_junctions = ($left_entry->{chr} . ":" . $left_entry->{pt_align} . ":" . $left_entry->{exon}->{orient},
+                                         $left_entry->{delta},
+                                         $right_entry->{chr} . ":" . $right_entry->{pt_align} . ":" . $right_entry->{exon}->{orient},
+                                         $right_entry->{delta},
+                    );
+                my $junction_text = join(";", @at_exon_junctions);
+                push(@x, $junction_text, $vts_complex_name);
+
+                # both at exon junctions ?
+                $integration_breakpoint_to_read_names_href->{$vts_complex_name}->{$junction_text}->{$read_name}++;
+                if ($virus_anchor_length >= $LONG_ANCHOR_SIZE) {
+                    $integration_breakpoint_to_long_anchor_href->{$vts_complex_name}->{$junction_text}->{'virus'} = 1;
+                }
+            }
+                
+        }
+    }
+
+}
+        
 sub map_chimeric_reads_to_genes {
     my ($junctions_file, $chr_to_interval_tree_href, $chr_gene_trans_to_exons_href, 
         $all_fusion_candidate_complex_names_href, $junction_breakpoint_to_read_names_href, $spans_to_read_names_href,
